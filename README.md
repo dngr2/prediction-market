@@ -131,7 +131,7 @@ selectors land thousands of successful calls):
 
 ## Tests
 
-**47 tests** (44 unit/fuzz + 3 stateful invariants), all green. Coverage includes:
+**58 tests** (55 unit/fuzz + 3 stateful invariants), all green. Coverage includes:
 complete-set round-trips, directional exposure via mint-then-sell, YES/NO/INVALID
 redemption, the INVALID odd-wei case, gating (early/late/twice/non-oracle resolve;
 early / no-share / double redeem), transfer-then-recipient-redeems, multi-market
@@ -155,3 +155,53 @@ script/Deploy.s.sol                 deploys the factory (no args, no owner)
 ```
 
 Toolchain: solc 0.8.26, `via_ir`, EVM `cancun`, OpenZeppelin v5.0.2.
+
+## Deep dive (v2)
+
+A second, adversarial pass audited the contract specifically for insolvency and
+fund-loss bugs across every mint / burn / transfer / resolve / redeem interleaving.
+
+**Result: no genuine bug found.** The complete-set, full-collateral model holds up;
+this pass adds hardening tests and documents the key solvency proof rather than
+fixing a defect.
+
+### The INVALID-split solvency proof (the crux)
+
+Because shares are freely and divisibly transferable with no on-chain YES/NO
+pairing, the worry is that scattering an odd balance across many accounts could sum
+to *more* than the pot under the "floor both legs" scheme. It cannot:
+
+- At resolution, `supplyYes == supplyNo == pot` (mint and burn always move both legs
+  and the pot together, in equal amounts).
+- Total INVALID payout is `Σ_h (floor(yes_h/2) + floor(no_h/2))`. Since
+  **sum-of-floors ≤ floor-of-sum**, `Σ_h floor(yes_h/2) ≤ floor(supplyYes/2)` and
+  likewise for NO, so the total is `≤ floor(S/2) + floor(S/2) ≤ S = pot`.
+- The same sub-additivity makes the bound hold at *every intermediate* redemption,
+  so the pot never underflows: `payoutsSoFar + floor(Y/2) + floor(N/2) ≤ S` at all
+  times. Fragmenting an odd balance therefore only *loses* payout to per-account
+  dust, which is retained by the pot. Splitting can never over-pay.
+
+YES/NO wins are exact: winners redeem `1` per share and `Σ winning shares == pot`,
+so the pot drains to exactly zero; losing shares are burned for `0`.
+
+### What this pass added
+
+- **Many-holder INVALID solvency** — an odd supply (101) scattered in odd chunks
+  across ten disjoint accounts on both legs; plus a fuzzed three-way split. Total
+  payout is always `≤ pot`; each holder gets exactly `floor(bal/2)`; dust is retained.
+- **Cross-market isolation under a hostile drain** — fully draining one market
+  leaves another (same token) fully redeemable; a two-token variant proves each
+  market pays only in its own collateral, no cross-funding.
+- **Post-resolution mint/burn are gated** — no minting free winning shares or
+  draining collateral after resolution (`TradingClosed`).
+- **Double-redeem hardening** — fan-out to many accounts then all redeem (total ==
+  supply); redeem-then-reacquire-by-transfer stays solvent; no share is spent twice.
+- **Transfer conservation** — self-transfer is a balance no-op; a fuzzed transfer
+  chain across three holders conserves the per-outcome sum and the tracked supply.
+- **Mutation sanity checks** — breaking the INVALID denominator (`/2 → /1`) is
+  caught by unit tests *and* `invariant_Solvency` (`pot below redeemable`); dropping
+  the mint NO-leg credit is caught by `invariant_ShareConservation` and the mint
+  unit test. The tests are non-hollow.
+
+Test count: **47 → 58**. Runtime bytecode **4,201 B** (EIP-170 margin ~20 KB).
+Invariants still run **12,800 calls each, 0 reverts** under `fail-on-revert = true`.
